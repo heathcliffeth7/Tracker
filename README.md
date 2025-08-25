@@ -265,21 +265,3 @@ tail -f bot_security.log
 
 This project is licensed under the MIT License.
 
-## Contributing
-
-1. Fork the project
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Create a Pull Request
-
-## Support
-
-If you encounter any issues:
-1. Report the issue on GitHub Issues
-2. Check log files
-3. Make sure the bot has necessary permissions
-
----
-
-**Note**: This bot should be used in compliance with Discord's Terms of Service. Act in accordance with local laws regarding the collection and processing of user data.
