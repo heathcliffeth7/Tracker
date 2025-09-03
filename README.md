@@ -54,7 +54,7 @@ TRACKED_ROLE_IDS=role_id1,role_id2,role_id3
 
 3. **Run the bot:**
 ```bash
-python tracker.py
+python3 tracker.py
 ```
 
 ## Configuration
