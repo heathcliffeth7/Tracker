@@ -82,10 +82,10 @@ CONTENT_CHANNEL_IDS = []  # Will be loaded from config file
 COMMAND_COOLDOWN = 5  # seconds
 user_command_times = defaultdict(lambda: 0)
 
-# Caching system to reduce API calls
+# Caching system to reduce API calls - OPTIMIZED
 member_cache = {}  # Cache for member objects
 role_cache = {}    # Cache for user roles
-cache_timeout = 300  # 5 minutes cache timeout
+cache_timeout = 1800  # 30 minutes cache timeout (increased from 5 minutes)
 
 # Batch processing for JSON writes
 pending_data_writes = {}
@@ -1013,17 +1013,25 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Only track users with tracked roles - use cached member lookup
-    try:
-        member = await get_cached_member(message.guild, message.author.id)
-        if not member:
-            # Member not found, process commands but don't track
+    # OPTIMIZATION: First try guild cache (no API call)
+    member = message.guild.get_member(message.author.id)
+    
+    # Only use API if member not in guild cache
+    if not member:
+        try:
+            member = await get_cached_member(message.guild, message.author.id)
+            if not member:
+                # Member not found, process commands but don't track
+                await bot.process_commands(message)
+                return
+        except Exception as e:
+            logger.error(f"Error fetching member {message.author.id}: {e}")
             await bot.process_commands(message)
             return
-            
-        user_role_ids = [role.id for role in member.roles]
 
-        # Check if user has any tracked role
+    # Check if user has any tracked role
+    try:
+        user_role_ids = [role.id for role in member.roles]
         has_tracked_role = any(role_id in TRACKED_ROLE_IDS for role_id in user_role_ids)
 
         # If no tracked roles configured, track everyone (for initial setup)
@@ -1037,7 +1045,6 @@ async def on_message(message):
 
     except Exception as e:
         logger.error(f"Error checking user roles for {message.author.id}: {e}")
-        # If error occurs, still process commands
         await bot.process_commands(message)
         return
 
@@ -1088,8 +1095,8 @@ async def on_message(message):
                     pending_data_writes.update(data)
                 logger.info(f"Content tracked: {len(new_links)} X/Twitter links from {message.author.name}")
 
-    # Get current user roles using cached function
-    current_roles = await get_cached_user_roles(message.guild, message.author.id)
+    # OPTIMIZATION: Use already fetched member for roles (no additional API call)
+    current_roles = get_user_roles(member)
 
     # Create user if not exists
     if user_id not in data:
@@ -1149,16 +1156,9 @@ async def on_member_update(before, after):
                 
             logger.info(f"Updated roles for user {after.name}: {current_roles}")
 
-            # Log role changes to audit log (but don't let this fail the whole operation)
-            try:
-                async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_role_update):
-                    if entry.target.id == after.id:
-                        logger.info(f"Audit Log - Role change by {entry.user.name}: {len(entry.before.roles)} -> {len(entry.after.roles)} roles")
-                        break
-            except discord.Forbidden:
-                logger.debug("No permission to access audit logs")
-            except Exception as e:
-                logger.debug(f"Audit log error: {e}")
+            # OPTIMIZATION: Audit log removed to prevent rate limiting
+            # Audit logs are expensive API calls that cause rate limiting
+            logger.debug(f"Role change detected for {after.name}: {len(before.roles)} -> {len(after.roles)} roles")
 
 @bot.event
 async def on_user_update(before, after):
