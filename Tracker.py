@@ -13,13 +13,18 @@ import logging
 import hashlib
 import jsonschema
 from pathlib import Path
+import ijson
+import gc
+from concurrent.futures import ThreadPoolExecutor
+import threading
+from typing import Dict, List, Any, Optional
 
 # Load .env file
 load_dotenv()
 
 # Setup secure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Debug level açıldı
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('bot_security.log'),
@@ -80,6 +85,12 @@ user_command_times = defaultdict(lambda: 0)
 # Maximum number of authorized users/roles for security
 MAX_AUTHORIZED_USERS = 50
 MAX_AUTHORIZED_ROLES = 20
+
+# Performance optimization settings for large datasets
+CHUNK_SIZE = 10000  # Process users in chunks of 10k
+MAX_MEMORY_USERS = 50000  # Keep max 50k users in memory at once
+ENABLE_PARALLEL_PROCESSING = True  # Enable multi-threading
+MAX_WORKER_THREADS = 4  # Number of worker threads
 
 # Time filters (in seconds) - added 'total' for all-time statistics
 TIME_FILTERS = {
@@ -461,9 +472,430 @@ def save_data(data):
     if not secure_file_write(DATA_FILE, data):
         logger.error("Failed to save message tracking data")
 
+def stream_user_data(file_path: Path, chunk_size: int = CHUNK_SIZE):
+    """Stream user data in chunks to avoid memory issues"""
+    try:
+        if not file_path.exists():
+            logger.warning(f"File does not exist: {file_path}")
+            return
+            
+        with open(file_path, 'rb') as file:
+            # Use ijson to stream parse the JSON file
+            parser = ijson.parse(file)
+            current_user_id = None
+            current_user_data = {}
+            users_processed = 0
+            chunk = {}
+            
+            for prefix, event, value in parser:
+                if prefix == '' and event == 'map_key':
+                    # New user ID
+                    if current_user_id and current_user_data:
+                        chunk[current_user_id] = current_user_data
+                        users_processed += 1
+                        
+                        # Yield chunk when it reaches chunk_size
+                        if users_processed >= chunk_size:
+                            yield chunk
+                            chunk = {}
+                            users_processed = 0
+                            gc.collect()  # Force garbage collection
+                    
+                    current_user_id = value
+                    current_user_data = {}
+                    
+                elif current_user_id:
+                    # Parse user data
+                    if prefix.endswith('.username') and event == 'string':
+                        current_user_data['username'] = value
+                    elif prefix.endswith('.current_roles') and event == 'start_array':
+                        current_user_data['current_roles'] = []
+                    elif prefix.endswith('.current_roles.item') and event == 'string':
+                        if 'current_roles' not in current_user_data:
+                            current_user_data['current_roles'] = []
+                        current_user_data['current_roles'].append(value)
+                    elif prefix.endswith('.messages') and event == 'start_array':
+                        current_user_data['messages'] = []
+                    elif prefix.endswith('.contents') and event == 'start_array':
+                        current_user_data['contents'] = []
+                    elif '.messages.' in prefix and event in ['string', 'number']:
+                        # Parse message data
+                        if 'messages' not in current_user_data:
+                            current_user_data['messages'] = []
+                        # This is simplified - you may need to handle message objects properly
+                    elif '.contents.' in prefix and event in ['string', 'number']:
+                        # Parse content data
+                        if 'contents' not in current_user_data:
+                            current_user_data['contents'] = []
+            
+            # Yield remaining data
+            if current_user_id and current_user_data:
+                chunk[current_user_id] = current_user_data
+            if chunk:
+                yield chunk
+                
+    except Exception as e:
+        logger.error(f"Error streaming data from {file_path}: {e}")
+
+def process_user_chunk(chunk: Dict[str, Any], filters: Dict[str, Any], 
+                      time_periods: Dict[str, datetime], role_conditions: Dict[str, List[str]],
+                      ctx) -> List[Dict[str, Any]]:
+    """Process a chunk of users for filtering - optimized for parallel processing"""
+    results = []
+    
+    for user_id, user_data in chunk.items():
+        try:
+            # Pre-calculate all time period counts in one pass
+            all_message_counts = {}
+            content_counts = {}
+            
+            # Initialize counts
+            for period_name in time_periods.keys():
+                all_message_counts[period_name] = 0
+                content_counts[period_name] = 0
+            
+            # Single pass through messages
+            channel_message_counts = {}
+            for period_name in time_periods.keys():
+                channel_message_counts[period_name] = 0
+                
+            for msg in user_data.get('messages', []):
+                try:
+                    msg_time = datetime.fromisoformat(msg['timestamp'])
+                    
+                    # Check if message is in the filtered channel
+                    msg_in_channel = True
+                    if 'channel' in filters:
+                        msg_in_channel = msg.get('channel_name', '').lower() == filters['channel'].lower()
+                    elif 'channel_id' in filters:
+                        msg_in_channel = str(msg.get('channel_id', '')) == str(filters['channel_id'])
+                    
+                    for period_name, period_start in time_periods.items():
+                        if msg_time > period_start:
+                            all_message_counts[period_name] += 1
+                            if msg_in_channel:
+                                channel_message_counts[period_name] += 1
+                except Exception:
+                    continue
+            
+            # Single pass through contents
+            for content_entry in user_data.get('contents', []):
+                try:
+                    content_time = datetime.fromisoformat(content_entry['timestamp'])
+                    for period_name, period_start in time_periods.items():
+                        if content_time > period_start:
+                            content_counts[period_name] += len(content_entry.get('twitter_links', []))
+                except Exception:
+                    continue
+            
+            # Apply filters efficiently
+            should_include = True
+            
+            # Get the target time period count
+            target_period = filters.get('time_period', 'total')
+            
+            # Use channel-specific message count if channel filter is active
+            if 'channel' in filters or 'channel_id' in filters:
+                message_count = channel_message_counts.get(target_period, 0)
+            else:
+                message_count = all_message_counts.get(target_period, 0)
+            
+            content_count = content_counts.get(target_period, 0)
+            
+            # Message filter
+            if 'message' in filters and message_count <= filters['message']:
+                should_include = False
+                
+            # Content filter
+            if 'content' in filters and content_count <= filters['content']:
+                should_include = False
+            
+            # Role filtering (if needed)
+            if should_include and (role_conditions['must_have'] or role_conditions['any_of'] or role_conditions['must_not_have']):
+                should_include = check_user_roles(user_id, role_conditions, ctx)
+            
+            if should_include:
+                results.append({
+                    'user_id': user_id,
+                    'username': user_data.get('username', 'Unknown'),
+                    'roles': user_data.get('current_roles', []),
+                    'message_count': message_count,
+                    'content_count': content_count,
+                    'all_message_counts': all_message_counts,
+                    'channel_message_counts': channel_message_counts,
+                    'all_content_counts': content_counts,
+                    'channels': list(set([msg.get('channel_name', 'Unknown') for msg in user_data.get('messages', [])])),
+                    'x_links': []  # Will be populated if needed
+                })
+                
+        except Exception as e:
+            logger.warning(f"Error processing user {user_id}: {e}")
+            continue
+    
+    return results
+
+def check_user_roles(user_id: str, role_conditions: Dict[str, List[str]], ctx) -> bool:
+    """Check if user meets role conditions - optimized version"""
+    try:
+        # This is expensive - cache results or use async version
+        member = ctx.guild.get_member(int(user_id))
+        if not member:
+            logger.debug(f"Member {user_id} not found in guild for role check")
+            return False
+            
+        user_role_ids = [role.id for role in member.roles]
+        logger.debug(f"User {user_id} has role IDs: {user_role_ids}")
+        
+        # Check MUST HAVE roles (AND logic)
+        for role_id in role_conditions['must_have']:
+            try:
+                role_id_int = int(role_id)
+                if role_id_int not in user_role_ids:
+                    logger.debug(f"User {user_id} missing required role {role_id}")
+                    return False
+                else:
+                    logger.debug(f"User {user_id} has required role {role_id}")
+            except ValueError:
+                logger.warning(f"Invalid role ID format: {role_id}")
+                return False
+        
+        # Check ANY OF roles (OR logic)
+        if role_conditions['any_of']:
+            has_any = False
+            for role_id in role_conditions['any_of']:
+                try:
+                    role_id_int = int(role_id)
+                    if role_id_int in user_role_ids:
+                        has_any = True
+                        logger.debug(f"User {user_id} has any_of role {role_id}")
+                        break
+                except ValueError:
+                    continue
+            if not has_any:
+                logger.debug(f"User {user_id} missing any_of roles: {role_conditions['any_of']}")
+                return False
+        
+        # Check MUST NOT HAVE roles (NOT logic)
+        for role_id in role_conditions['must_not_have']:
+            try:
+                role_id_int = int(role_id)
+                if role_id_int in user_role_ids:
+                    logger.debug(f"User {user_id} has forbidden role {role_id}")
+                    return False
+            except ValueError:
+                continue
+        
+        logger.debug(f"User {user_id} passes all role checks")        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"Error checking roles for user {user_id}: {e}")
+        return False
+
+async def process_large_dataset_streaming(ctx, filters, all_time_periods, role_conditions, time_limit):
+    """Process large datasets using streaming and parallel processing"""
+    filtered_results = []
+    total_processed = 0
+    
+    # Send progress message
+    progress_msg = await ctx.send("🔄 Processing large dataset... 0 users processed")
+    
+    try:
+        if ENABLE_PARALLEL_PROCESSING:
+            # Use ThreadPoolExecutor for CPU-intensive processing
+            with ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS) as executor:
+                futures = []
+                
+                # Process data in chunks using streaming
+                for chunk in stream_user_data(DATA_FILE, CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    
+                    # Submit chunk for parallel processing
+                    future = executor.submit(process_user_chunk, chunk, filters, all_time_periods, role_conditions, ctx)
+                    futures.append(future)
+                    
+                    # Process completed futures to avoid memory buildup
+                    if len(futures) >= MAX_WORKER_THREADS:
+                        for future in futures:
+                            chunk_results = future.result()
+                            filtered_results.extend(chunk_results)
+                            total_processed += len(chunk)
+                        futures = []
+                        
+                        # Update progress
+                        try:
+                            await progress_msg.edit(content=f"🔄 Processing large dataset... {total_processed:,} users processed")
+                        except:
+                            pass
+                        
+                        gc.collect()  # Force garbage collection
+                
+                # Process remaining futures
+                for future in futures:
+                    chunk_results = future.result()
+                    filtered_results.extend(chunk_results)
+                    total_processed += len(chunk)
+        else:
+            # Sequential processing if parallel processing is disabled
+            for chunk in stream_user_data(DATA_FILE, CHUNK_SIZE):
+                if not chunk:
+                    continue
+                    
+                chunk_results = process_user_chunk(chunk, filters, all_time_periods, role_conditions, ctx)
+                filtered_results.extend(chunk_results)
+                total_processed += len(chunk)
+                
+                # Update progress every 50k users
+                if total_processed % 50000 == 0:
+                    try:
+                        await progress_msg.edit(content=f"🔄 Processing large dataset... {total_processed:,} users processed")
+                    except:
+                        pass
+                
+                gc.collect()
+        
+        # Delete progress message
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+            
+        logger.info(f"Streaming processing completed: {total_processed:,} users processed, {len(filtered_results)} results")
+        return filtered_results
+        
+    except Exception as e:
+        logger.error(f"Error in streaming processing: {e}")
+        try:
+            await progress_msg.delete()
+        except:
+            pass
+        return []
+
+def process_standard_dataset(data, filters, all_time_periods, role_conditions, time_limit, ctx):
+    """Process standard datasets (non-streaming) - optimized version"""
+    filtered_results = []
+    
+    logger.info(f"Processing {len(data)} users with standard method")
+    
+    for user_id, user_data in data.items():
+        try:
+            # Pre-calculate all time period counts in one pass
+            all_message_counts = {}
+            content_counts = {}
+            
+            # Initialize counts
+            for period_name in all_time_periods.keys():
+                all_message_counts[period_name] = 0
+                content_counts[period_name] = 0
+            
+            # Single pass through messages
+            channel_message_counts = {}
+            for period_name in all_time_periods.keys():
+                channel_message_counts[period_name] = 0
+                
+            for msg in user_data.get('messages', []):
+                try:
+                    msg_time = datetime.fromisoformat(msg['timestamp'])
+                    
+                    # Check if message is in the filtered channel
+                    msg_in_channel = True
+                    if 'channel' in filters:
+                        msg_in_channel = msg.get('channel_name', '').lower() == filters['channel'].lower()
+                    elif 'channel_id' in filters:
+                        msg_in_channel = str(msg.get('channel_id', '')) == str(filters['channel_id'])
+                    
+                    for period_name, period_start in all_time_periods.items():
+                        if msg_time > period_start:
+                            all_message_counts[period_name] += 1
+                            if msg_in_channel:
+                                channel_message_counts[period_name] += 1
+                except Exception:
+                    continue
+            
+            # Single pass through contents
+            for content_entry in user_data.get('contents', []):
+                try:
+                    content_time = datetime.fromisoformat(content_entry['timestamp'])
+                    for period_name, period_start in all_time_periods.items():
+                        if content_time > period_start:
+                            content_counts[period_name] += len(content_entry.get('twitter_links', []))
+                except Exception:
+                    continue
+            
+            # Apply filters efficiently
+            should_include = True
+            
+            # Get the target time period count
+            target_period = filters.get('time_period', 'total')
+            
+            # Use channel-specific message count if channel filter is active
+            if 'channel' in filters or 'channel_id' in filters:
+                message_count = channel_message_counts.get(target_period, 0)
+            else:
+                message_count = all_message_counts.get(target_period, 0)
+            
+            content_count = content_counts.get(target_period, 0)
+            
+            # Message filter
+            if 'message' in filters and message_count <= filters['message']:
+                should_include = False
+                
+            # Content filter
+            if 'content' in filters and content_count <= filters['content']:
+                should_include = False
+            
+            # Role filtering (if needed)
+            if should_include and (role_conditions['must_have'] or role_conditions['any_of'] or role_conditions['must_not_have']):
+                should_include = check_user_roles(user_id, role_conditions, ctx)
+            
+            if should_include:
+                # Collect X links for the specified time period (sorted by newest first)
+                x_links_in_period = []
+                try:
+                    link_to_time = {}
+                    for entry in user_data.get('contents', []):
+                        try:
+                            entry_time = datetime.fromisoformat(entry.get('timestamp', datetime.min.isoformat()))
+                        except Exception:
+                            continue
+                        if entry_time > time_limit:
+                            for link in entry.get('twitter_links', []):
+                                if (link not in link_to_time) or (entry_time > link_to_time[link]):
+                                    link_to_time[link] = entry_time
+                    x_links_in_period = [lt[0] for lt in sorted(link_to_time.items(), key=lambda kv: kv[1], reverse=True)]
+                except Exception:
+                    x_links_in_period = []
+                
+                filtered_results.append({
+                    'user_id': user_id,
+                    'username': user_data.get('username', 'Unknown'),
+                    'roles': user_data.get('current_roles', []),
+                    'message_count': message_count,
+                    'content_count': content_count,
+                    'all_message_counts': all_message_counts,
+                    'channel_message_counts': channel_message_counts,
+                    'all_content_counts': content_counts,
+                    'channels': list(set([msg.get('channel_name', 'Unknown') for msg in user_data.get('messages', [])])),
+                    'x_links': x_links_in_period
+                })
+                
+        except Exception as e:
+            logger.warning(f"Error processing user {user_id}: {e}")
+            continue
+    
+    return filtered_results
+
 def get_user_roles(member):
-    """Returns user's roles"""
-    return [role.name for role in member.roles if role.name != '@everyone']
+    """Returns user's roles with both names and IDs"""
+    roles_data = []
+    for role in member.roles:
+        if role.name != '@everyone':
+            roles_data.append({
+                'name': role.name,
+                'id': str(role.id)
+            })
+    return roles_data
 
 @bot.event
 async def on_ready():
@@ -649,6 +1081,17 @@ async def filter_users(ctx, *args):
     !filter message>2000 roleid 123456789012345678 and roleid 987654321098765432 nohave roleid 555666777888999111 90d - Complex role ID filtering
     """
 
+    # Clean arguments - remove invisible characters and empty strings
+    cleaned_args = []
+    for arg in args:
+        # Remove invisible characters like word joiner (\u2060), zero-width space, etc.
+        cleaned_arg = ''.join(char for char in arg if char.isprintable() and ord(char) >= 32)
+        if cleaned_arg.strip():  # Only add non-empty args
+            cleaned_args.append(cleaned_arg.strip())
+    
+    args = cleaned_args
+    logger.debug(f"Cleaned args: {args}")
+    
     # Parse arguments with advanced role logic
     filters = {}
     time_period = 'total'  # Changed default to total instead of 30d
@@ -658,15 +1101,85 @@ async def filter_users(ctx, *args):
         'must_not_have': []   # NOHAVE roles - user MUST NOT have ANY of these
     }
 
+    # Helper utilities for role parsing (supports spaces and quotes)
+    def _find_role_by_name_exact(name: str):
+        for r in ctx.guild.roles:
+            if r.name.lower() == name.lower():
+                return r
+        return None
+
+    def _parse_multiword_role(start_index: int):
+        """Parse role tokens starting at an '@' token.
+        Returns (role_id_str, extra_tokens_consumed).
+        extra_tokens_consumed does NOT include the first token itself.
+        """
+        if start_index >= len(args):
+            return None, 0
+
+        token = args[start_index]
+        if not token.startswith('@'):
+            return None, 0
+
+        # Remove initial '@'
+        first_part = token[1:]
+        name_parts = [first_part]
+        j = start_index + 1
+
+        # If quoted, keep consuming until closing quote
+        if first_part.startswith('"'):
+            name_parts[0] = name_parts[0][1:]
+            while j < len(args):
+                part = args[j]
+                if part.endswith('"'):
+                    name_parts.append(part[:-1])
+                    j += 1
+                    break
+                else:
+                    name_parts.append(part)
+                    j += 1
+        else:
+            # Consume until a delimiter token (operator/other filters/channel/time) is reached
+            # Also check if the next token starts with @ (another role)
+            while j < len(args):
+                peek = args[j]
+                lower = peek.lower()
+                if (
+                    lower in ['and', 'or', 'nohave']
+                    or peek.startswith('@')  # Another role mention
+                    or peek.startswith('#')
+                    or peek.startswith('<#')
+                    or peek.startswith('<@&')  # Discord role mention
+                    or lower in TIME_FILTERS
+                    or ('>' in peek and not peek.startswith('@'))  # Filter but not role mention
+                    or peek.startswith('top')
+                    or lower == 'roleid'
+                ):
+                    break
+                name_parts.append(peek)
+                j += 1
+
+        candidate_name = ' '.join([p for p in name_parts if p]).strip()
+        logger.debug(f"Parsing multiword role: '{candidate_name}' from tokens {name_parts}")
+        
+        role_obj = _find_role_by_name_exact(candidate_name)
+        if role_obj:
+            logger.debug(f"Found role: {candidate_name} -> ID: {role_obj.id}")
+            return str(role_obj.id), (j - start_index - 1)
+        
+        logger.debug(f"Role not found: '{candidate_name}'")
+        return None, 0
+
     i = 0
     while i < len(args):
         arg = args[i]
+        logger.debug(f"Processing argument {i}: '{arg}' (type: {type(arg)})")
 
         if arg in TIME_FILTERS:
             time_period = arg
         elif arg.startswith('#'):
             # Channel filter
             filters['channel'] = arg[1:]  # Remove # prefix
+            logger.debug(f"Added channel filter: {filters['channel']}")
         elif arg.startswith('<#') and arg.endswith('>'):
             # Discord channel mention format <#channel_id>
             try:
@@ -678,13 +1191,36 @@ async def filter_users(ctx, *args):
             else:
                 await ctx.send("❌ Invalid channel mention format!")
                 return
+        elif arg.startswith('<@&') and arg.endswith('>'):
+            # Discord role mention format <@&role_id>
+            try:
+                role_id = arg[3:-1]  # Remove <@& and >
+                logger.debug(f"Processing Discord role mention: {arg} -> role_id: {role_id}")
+                if role_id.isdigit():
+                    # Check if next argument is 'or' to determine where to add this role
+                    if i + 1 < len(args) and args[i + 1].lower() == 'or':
+                        role_conditions['any_of'].append(role_id)
+                        logger.debug(f"Added Discord role {role_id} to any_of (because next is 'or')")
+                    else:
+                        role_conditions['must_have'].append(role_id)
+                        logger.debug(f"Added Discord role {role_id} to must_have conditions")
+                else:
+                    await ctx.send("❌ Invalid role mention format!")
+                    return
+            except Exception as e:
+                logger.error(f"Error parsing role mention {arg}: {e}")
+                await ctx.send("❌ Error parsing role mention!")
+                return
         elif '>' in arg:
             # Filter criteria like message>1000, content>10
             filter_type, value = arg.split('>', 1)
+            logger.debug(f"Parsing filter: {filter_type}>{value}")
             try:
                 filters[filter_type] = int(value)
+                logger.debug(f"Successfully parsed filter: {filter_type}={int(value)}")
             except ValueError:
-                await ctx.send(f"❌ Invalid filter value: {value}")
+                logger.error(f"Invalid filter value - arg: '{arg}', filter_type: '{filter_type}', value: '{value}'")
+                await ctx.send(f"❌ Invalid filter value: {value} (from {arg})")
                 return
         elif arg.startswith('top'):
             # Top parameter
@@ -700,44 +1236,98 @@ async def filter_users(ctx, *args):
         elif arg.lower() in ['and', 'or', 'nohave']:
             # Role operators
             operator = arg.lower()
+            logger.debug(f"Processing operator: {operator} at position {i}")
 
             # Get the next argument as role
             if i + 1 < len(args):
                 next_arg = args[i + 1]
                 role_id = None
+                logger.debug(f"Next arg after {operator}: {next_arg}")
 
                 if next_arg == 'roleid' and i + 2 < len(args):
                     # Format: roleid 123456789012345678 (with space)
                     role_id_str = args[i + 2]
+                    logger.debug(f"Processing roleid format: {next_arg} {role_id_str}")
                     if role_id_str.isdigit() and len(role_id_str) >= 17 and len(role_id_str) <= 20:
                         role_id = role_id_str
+                        logger.debug(f"Valid role ID found: {role_id}")
                         i += 1  # Skip the role ID argument as well
                     else:
                         await ctx.send(f"❌ Invalid role ID format: {role_id_str}. Use roleid 123456789012345678")
                         return
-                elif next_arg.startswith('@'):
-                    # Role mention like @Admin
-                    role_name = next_arg[1:]  # Remove @
-                    role_obj = None
-                    for r in ctx.guild.roles:
-                        if r.name.lower() == role_name.lower():
-                            role_obj = r
-                            break
-                    if role_obj:
-                        role_id = str(role_obj.id)
-                    else:
-                        await ctx.send(f"❌ Role not found: @{role_name}")
+                elif next_arg.startswith('<@&') and next_arg.endswith('>'):
+                    # Discord role mention format <@&role_id>
+                    try:
+                        role_id = next_arg[3:-1]  # Remove <@& and >
+                        logger.debug(f"Processing Discord role mention after {operator}: {next_arg} -> role_id: {role_id}")
+                        if role_id.isdigit():
+                            logger.debug(f"Valid Discord role ID found: {role_id}")
+                        else:
+                            await ctx.send("❌ Invalid Discord role mention format!")
+                            return
+                    except Exception as e:
+                        logger.error(f"Error parsing Discord role mention {next_arg}: {e}")
+                        await ctx.send("❌ Error parsing Discord role mention!")
                         return
+                elif next_arg.startswith('@'):
+                    # Role mention like @Admin or @"Waiting Room" or @Waiting Room
+                    parsed_role_id, extra_tokens = _parse_multiword_role(i + 1)
+                    if parsed_role_id:
+                        role_id = parsed_role_id
+                        i += extra_tokens  # consume additional tokens used by multiword role
+                        logger.debug(f"Parsed multiword role -> id: {role_id}")
+                    else:
+                        # Fallback to single-token name first
+                        role_name = next_arg[1:]
+                        role_obj = _find_role_by_name_exact(role_name)
+                        if role_obj:
+                            role_id = str(role_obj.id)
+                            logger.debug(f"Found role by name: {role_name} -> {role_id}")
+                        else:
+                            # Try multiword parsing manually
+                            multiword_parts = [role_name]
+                            j = i + 2  # Start from the token after next_arg
+                            while j < len(args):
+                                token = args[j]
+                                if (token.lower() in ['and', 'or', 'nohave'] or 
+                                    token.startswith('@') or 
+                                    token.startswith('#') or 
+                                    token.startswith('<') or
+                                    token.lower() in TIME_FILTERS or
+                                    '>' in token or
+                                    token.startswith('top') or
+                                    token.lower() == 'roleid'):
+                                    break
+                                multiword_parts.append(token)
+                                j += 1
+                            
+                            full_role_name = ' '.join(multiword_parts)
+                            role_obj = _find_role_by_name_exact(full_role_name)
+                            if role_obj:
+                                role_id = str(role_obj.id)
+                                i += (j - i - 2)  # consume the extra tokens
+                                logger.debug(f"Found multiword role: {full_role_name} -> {role_id}")
+                            else:
+                                await ctx.send(f"❌ Role not found: @{full_role_name}")
+                                return
                 else:
-                    await ctx.send(f"❌ Invalid role format: {next_arg}. Use 'roleid 123456789012345678' or @rolename")
+                    await ctx.send(f"❌ Invalid role format: {next_arg}. Use 'roleid 123456789012345678', @rolename, or <@&role_id>")
                     return
 
-                if operator == 'and':
-                    role_conditions['must_have'].append(role_id)
-                elif operator == 'or':
-                    role_conditions['any_of'].append(role_id)
-                elif operator == 'nohave':
-                    role_conditions['must_not_have'].append(role_id)
+                # Add role to appropriate condition based on operator
+                if role_id:  # Make sure we have a valid role_id
+                    if operator == 'and':
+                        role_conditions['must_have'].append(role_id)
+                        logger.debug(f"Added {role_id} to must_have")
+                    elif operator == 'or':
+                        role_conditions['any_of'].append(role_id)
+                        logger.debug(f"Added {role_id} to any_of")
+                    elif operator == 'nohave':
+                        role_conditions['must_not_have'].append(role_id)
+                        logger.debug(f"Added {role_id} to must_not_have")
+                else:
+                    await ctx.send(f"❌ Failed to parse role after {operator} operator")
+                    return
 
                 i += 1  # Skip next argument
             else:
@@ -746,25 +1336,76 @@ async def filter_users(ctx, *args):
         elif arg == 'roleid' and i + 1 < len(args):
             # Single role ID with space: roleid 123456789012345678
             role_id_str = args[i + 1]
+            logger.debug(f"Processing single roleid: {role_id_str}")
             if role_id_str.isdigit() and len(role_id_str) >= 17 and len(role_id_str) <= 20:
-                role_conditions['must_have'].append(role_id_str)
+                # Check if the argument after role_id is 'or' - if so, this should go to any_of
+                if i + 2 < len(args) and args[i + 2].lower() == 'or':
+                    role_conditions['any_of'].append(role_id_str)
+                    logger.debug(f"Added {role_id_str} to any_of (because next is 'or')")
+                else:
+                    role_conditions['must_have'].append(role_id_str)
+                    logger.debug(f"Added {role_id_str} to must_have")
                 i += 1  # Skip the role ID argument
             else:
                 await ctx.send(f"❌ Invalid role ID format: {role_id_str}. Use roleid 123456789012345678")
                 return
         elif arg.startswith('@'):
-            # Single role mention like @Admin
-            role_name = arg[1:]  # Remove @
-            role_obj = None
-            for r in ctx.guild.roles:
-                if r.name.lower() == role_name.lower():
-                    role_obj = r
-                    break
-            if role_obj:
-                role_conditions['must_have'].append(str(role_obj.id))
+            # Single role mention like @Admin or @Waiting Room (with spaces) or @"Role Name"
+            parsed_role_id, extra_tokens = _parse_multiword_role(i)
+            if parsed_role_id:
+                # Check if the next argument (after consuming extra tokens) is 'or'
+                next_arg_index = i + extra_tokens + 1
+                if next_arg_index < len(args) and args[next_arg_index].lower() == 'or':
+                    role_conditions['any_of'].append(parsed_role_id)
+                    logger.debug(f"Added role {parsed_role_id} to any_of (because next is 'or')")
+                else:
+                    role_conditions['must_have'].append(parsed_role_id)
+                    logger.debug(f"Added role {parsed_role_id} to must_have")
+                i += extra_tokens  # we will still increment by 1 at loop end
             else:
-                await ctx.send(f"❌ Role not found: @{role_name}")
-                return
+                # Fallback single-token behavior - try just the first token after @
+                role_name = arg[1:]
+                role_obj = _find_role_by_name_exact(role_name)
+                if role_obj:
+                    if i + 1 < len(args) and args[i + 1].lower() == 'or':
+                        role_conditions['any_of'].append(str(role_obj.id))
+                        logger.debug(f"Added @{role_name} ({role_obj.id}) to any_of (because next is 'or')")
+                    else:
+                        role_conditions['must_have'].append(str(role_obj.id))
+                        logger.debug(f"Added @{role_name} ({role_obj.id}) to must_have")
+                else:
+                    # If single token failed, try to construct multiword role name manually
+                    # by consuming tokens until we find a delimiter or role
+                    multiword_parts = [role_name]
+                    j = i + 1
+                    while j < len(args):
+                        next_token = args[j]
+                        if (next_token.lower() in ['and', 'or', 'nohave'] or 
+                            next_token.startswith('@') or 
+                            next_token.startswith('#') or 
+                            next_token.startswith('<') or
+                            next_token.lower() in TIME_FILTERS or
+                            '>' in next_token or
+                            next_token.startswith('top') or
+                            next_token.lower() == 'roleid'):
+                            break
+                        multiword_parts.append(next_token)
+                        j += 1
+                    
+                    full_role_name = ' '.join(multiword_parts)
+                    role_obj = _find_role_by_name_exact(full_role_name)
+                    if role_obj:
+                        extra_consumed = j - i - 1
+                        if j < len(args) and args[j].lower() == 'or':
+                            role_conditions['any_of'].append(str(role_obj.id))
+                            logger.debug(f"Added multiword @{full_role_name} ({role_obj.id}) to any_of (because next is 'or')")
+                        else:
+                            role_conditions['must_have'].append(str(role_obj.id))
+                            logger.debug(f"Added multiword @{full_role_name} ({role_obj.id}) to must_have")
+                        i += extra_consumed
+                    else:
+                        await ctx.send(f"❌ Role not found: @{full_role_name}")
+                        return
         else:
             await ctx.send(f"❌ Invalid argument: {arg}. Use role ID, @rolename, time period, or filters")
             return
@@ -772,14 +1413,12 @@ async def filter_users(ctx, *args):
         i += 1
 
     logger.debug(f"Parsed filters: {filters}, time: {time_period}, role_conditions: {role_conditions}")
+    logger.info(f"Filter command - Role conditions: must_have={role_conditions['must_have']}, any_of={role_conditions['any_of']}, must_not_have={role_conditions['must_not_have']}")
 
     # Validate time filter
     if time_period not in TIME_FILTERS:
         await ctx.send(f"Invalid time filter! Available filters: {', '.join(TIME_FILTERS.keys())}")
         return
-
-    # Load data
-    data = load_data()
 
     # Calculate time limit (0 for total means no limit)
     time_limit = datetime.now() - timedelta(seconds=TIME_FILTERS[time_period]) if TIME_FILTERS[time_period] > 0 else datetime.min
@@ -796,181 +1435,47 @@ async def filter_users(ctx, *args):
         '360d': now - timedelta(days=360),
         'total': datetime.min
     }
+    
+    # Add time period to filters for chunk processing
+    filters['time_period'] = time_period
+    
+    # Start optimized processing
+    logger.info(f"Starting optimized filtering for 1M+ users - using streaming and parallel processing")
+    start_time = datetime.now()
 
-    # Detect channel filter settings
-    channel_filter_active = ('channel' in filters) or ('channel_id' in filters)
-    target_channel_id = str(filters.get('channel_id', '')) if channel_filter_active else ''
-    target_channel_name = filters.get('channel', None) if channel_filter_active else None
-
-    # Calculate ALL message counts (for general stats)
-    user_all_message_counts = {}
-    for user_id, user_data in data.items():
-        user_all_message_counts[user_id] = {}
-        for period_name, period_start in all_time_periods.items():
-            count = 0
-            for msg in user_data['messages']:
-                try:
-                    msg_time = datetime.fromisoformat(msg['timestamp'])
-                except Exception:
-                    continue
-                if msg_time > period_start:
-                    count += 1
-            user_all_message_counts[user_id][period_name] = count
-
-    # Calculate CHANNEL-SPECIFIC message counts (if filter is active)
-    user_channel_message_counts = {}
-    if channel_filter_active:
-        for user_id, user_data in data.items():
-            user_channel_message_counts[user_id] = {}
-            for period_name, period_start in all_time_periods.items():
-                count = 0
-                for msg in user_data['messages']:
-                    try:
-                        msg_time = datetime.fromisoformat(msg['timestamp'])
-                    except Exception:
-                        continue
-                    if msg_time <= period_start:
-                        continue
-                    # Check if message is in target channel
-                    msg_channel_id = msg.get('channel_id')
-                    msg_channel_name = msg.get('channel_name')
-                    in_channel = False
-                    if target_channel_id and str(msg_channel_id) == target_channel_id:
-                        in_channel = True
-                    if (not in_channel) and target_channel_name and msg_channel_name == target_channel_name:
-                        in_channel = True
-                    if in_channel:
-                        count += 1
-                user_channel_message_counts[user_id][period_name] = count
-    else:
-        # No channel filter, so channel counts = all counts
-        user_channel_message_counts = user_all_message_counts
-
-    # Calculate content counts for all time periods from message_tracking.json contents
-    user_content_counts = {}
-    for user_id, user_data in data.items():
-        user_content_counts[user_id] = {}
-        contents_list = user_data.get('contents', [])
-        for period_name, period_start in all_time_periods.items():
-            count = 0
-            for content_entry in contents_list:
-                try:
-                    content_time = datetime.fromisoformat(content_entry['timestamp'])
-                except Exception:
-                    continue
-                if content_time > period_start:
-                    count += len(content_entry.get('twitter_links', []))
-            user_content_counts[user_id][period_name] = count
-
-    # List to hold filtered results
-    filtered_results = []
-
-    for user_id, user_data in data.items():
-        # Get message count for the specified time period (use channel-specific if filtered)
-        if time_period == 'total':
-            total_messages = user_channel_message_counts[user_id]['total']
+    # Use optimized streaming processing for 1M+ users
+    try:
+        # Try to use standard loading for smaller datasets first
+        file_size = DATA_FILE.stat().st_size if DATA_FILE.exists() else 0
+        file_size_mb = file_size / (1024 * 1024)
+        
+        if file_size_mb > 100:  # If file is larger than 100MB, use streaming
+            logger.info(f"Large dataset detected ({file_size_mb:.1f}MB) - using streaming processing")
+            filtered_results = await process_large_dataset_streaming(ctx, filters, all_time_periods, role_conditions, time_limit)
         else:
-            total_messages = user_channel_message_counts[user_id][time_period]
+            logger.info(f"Small dataset ({file_size_mb:.1f}MB) - using standard processing")
+            # Load data normally for smaller datasets
+            data = load_data()
+            filtered_results = process_standard_dataset(data, filters, all_time_periods, role_conditions, time_limit, ctx)
+            
+    except Exception as e:
+        logger.error(f"Error during optimized processing: {e}")
+        # Fallback to standard processing
+        logger.info("Falling back to standard processing")
+        data = load_data()
+        filtered_results = process_standard_dataset(data, filters, all_time_periods, role_conditions, time_limit, ctx)
 
-        # Get content count for the specified time period
-        content_count = user_content_counts[user_id][time_period]
-
-        # Collect X links for the specified time period (sorted by newest first)
-        x_links_in_period = []
-        try:
-            link_to_time = {}
-            for entry in user_data.get('contents', []):
-                try:
-                    entry_time = datetime.fromisoformat(entry.get('timestamp', datetime.min.isoformat()))
-                except Exception:
-                    continue
-                if entry_time > time_limit:
-                    for link in entry.get('twitter_links', []):
-                        if (link not in link_to_time) or (entry_time > link_to_time[link]):
-                            link_to_time[link] = entry_time
-            x_links_in_period = [lt[0] for lt in sorted(link_to_time.items(), key=lambda kv: kv[1], reverse=True)]
-        except Exception:
-            x_links_in_period = []
-
-        # Apply filters
-        should_include = True
-
-        # Message count filter
-        if 'message' in filters:
-            if total_messages <= filters['message']:
-                should_include = False
-
-        # Content count filter
-        if 'content' in filters:
-            if content_count <= filters['content']:
-                should_include = False
-
-        # Channel filter
-        if 'channel' in filters or 'channel_id' in filters:
-            # Prefer channel_id comparison if provided
-            target_channel_id = str(filters.get('channel_id', ''))
-            target_channel_name = filters.get('channel', None)
-            has_messages_in_channel = False
-            for msg in user_data['messages']:
-                if target_channel_id and msg.get('channel_id') == target_channel_id:
-                    has_messages_in_channel = True
-                    break
-                if target_channel_name and msg.get('channel_name') == target_channel_name:
-                    has_messages_in_channel = True
-                    break
-            if not has_messages_in_channel:
-                should_include = False
-
-        # Advanced role filtering
-        if role_conditions['must_have'] or role_conditions['any_of'] or role_conditions['must_not_have']:
-            try:
-                member = await ctx.guild.fetch_member(int(user_id))
-                user_role_ids = [role.id for role in member.roles]
-
-                # Check MUST HAVE roles (AND logic)
-                for role_id in role_conditions['must_have']:
-                    if int(role_id) not in user_role_ids:
-                        should_include = False
-                        break
-
-                # Check ANY OF roles (OR logic) - only if not already excluded
-                if should_include and role_conditions['any_of']:
-                    has_any_role = any(int(role_id) in user_role_ids for role_id in role_conditions['any_of'])
-                    if not has_any_role:
-                        should_include = False
-
-                # Check MUST NOT HAVE roles (NOT logic)
-                if should_include:
-                    for role_id in role_conditions['must_not_have']:
-                        if int(role_id) in user_role_ids:
-                            should_include = False
-                            break
-            except discord.NotFound:
-                should_include = False
-
-        # Only include if passes all filters
-        # If no filters are applied, include all users (even with 0 messages for completeness)
-        no_filters_applied = not (filters or role_conditions['must_have'] or role_conditions['any_of'] or role_conditions['must_not_have'])
-        if should_include and (total_messages > 0 or no_filters_applied):
-            filtered_results.append({
-                'user_id': user_id,
-                'username': user_data['username'],
-                'roles': user_data.get('current_roles', []),
-                'message_count': total_messages,
-                'content_count': content_count,
-                'channels': ([filters.get('channel')] if channel_filter_active and target_channel_name else list(set([msg['channel_name'] for msg in user_data['messages']]))) ,
-                'channel_message_counts': user_channel_message_counts[user_id],
-                'all_message_counts': user_all_message_counts[user_id],
-                'all_content_counts': user_content_counts[user_id],
-                'x_links': x_links_in_period
-            })
-
+    # Log performance metrics
+    end_time = datetime.now()
+    processing_time = (end_time - start_time).total_seconds()
+    logger.info(f"Filter processing completed in {processing_time:.2f} seconds - {len(filtered_results)} results found")
+    
     if not filtered_results:
         # If no filters were applied and no results, show message about criteria
         if filters or role_conditions['must_have'] or role_conditions['any_of'] or role_conditions['must_not_have']:
-            await ctx.send("No users found matching the specified criteria!")
+            await ctx.send(f"No users found matching the specified criteria! (Processed in {processing_time:.1f}s)")
         else:
-            await ctx.send("No users found in the database!")
+            await ctx.send(f"No users found in the database! (Processed in {processing_time:.1f}s)")
         return
 
     # Sort by message count (highest first) and apply limit if specified
@@ -1043,7 +1548,12 @@ async def filter_users(ctx, *args):
         results_text += f"{rank_emoji} **{result['username']}**\n"
         results_text += f"   📝 Messages: {result['message_count']}\n"
         results_text += f"   📊 Content: {result['content_count']}\n"
-        results_text += f"   👑 Roles: {', '.join(result['roles'])}\n\n"
+        # Handle both old and new role format
+        if result['roles'] and isinstance(result['roles'][0], dict):
+            role_names = [role['name'] for role in result['roles']]
+        else:
+            role_names = result['roles']
+        results_text += f"   👑 Roles: {', '.join(role_names)}\n\n"
 
     # Create Excel file
     filename = f"advanced_filter_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1075,7 +1585,12 @@ def create_excel_report(results, filename):
     for row_num, result in enumerate(results, 2):
         ws.cell(row=row_num, column=1, value=result['username'])
         ws.cell(row=row_num, column=2, value=result['user_id'])
-        ws.cell(row=row_num, column=3, value=', '.join(result['roles']))
+        # Handle both old and new role format
+        if result['roles'] and isinstance(result['roles'][0], dict):
+            role_names = [role['name'] for role in result['roles']]
+        else:
+            role_names = result['roles']
+        ws.cell(row=row_num, column=3, value=', '.join(role_names))
         ws.cell(row=row_num, column=4, value=result['message_count'])
         ws.cell(row=row_num, column=5, value=', '.join(result['channels']))
 
@@ -1187,7 +1702,12 @@ def create_advanced_excel_report(results, filters, time_period, role_conditions,
         col_num += 1
         ws.cell(row=row_num, column=col_num, value=result['user_id'])
         col_num += 1
-        ws.cell(row=row_num, column=col_num, value=', '.join(result['roles']))
+        # Handle both old and new role format
+        if result['roles'] and isinstance(result['roles'][0], dict):
+            role_names = [role['name'] for role in result['roles']]
+        else:
+            role_names = result['roles']
+        ws.cell(row=row_num, column=col_num, value=', '.join(role_names))
         col_num += 1
 
         # Channel-specific message counts first (if channel filter is active)
