@@ -82,6 +82,16 @@ CONTENT_CHANNEL_IDS = []  # Will be loaded from config file
 COMMAND_COOLDOWN = 5  # seconds
 user_command_times = defaultdict(lambda: 0)
 
+# Caching system to reduce API calls
+member_cache = {}  # Cache for member objects
+role_cache = {}    # Cache for user roles
+cache_timeout = 300  # 5 minutes cache timeout
+
+# Batch processing for JSON writes
+pending_data_writes = {}
+last_data_write = 0
+DATA_WRITE_INTERVAL = 30  # Write to JSON every 30 seconds instead of every message
+
 # Maximum number of authorized users/roles for security
 MAX_AUTHORIZED_USERS = 50
 MAX_AUTHORIZED_ROLES = 20
@@ -897,10 +907,105 @@ def get_user_roles(member):
             })
     return roles_data
 
+async def get_cached_member(guild, user_id):
+    """Get member with caching to reduce API calls"""
+    cache_key = f"{guild.id}_{user_id}"
+    current_time = asyncio.get_event_loop().time()
+    
+    # Check if we have cached data and it's still valid
+    if cache_key in member_cache:
+        cached_data, cache_time = member_cache[cache_key]
+        if current_time - cache_time < cache_timeout:
+            return cached_data
+    
+    # Fetch from API if not cached or expired
+    try:
+        member = await guild.fetch_member(user_id)
+        member_cache[cache_key] = (member, current_time)
+        return member
+    except (discord.NotFound, discord.Forbidden):
+        # Cache the fact that member was not found to avoid repeated API calls
+        member_cache[cache_key] = (None, current_time)
+        return None
+    except Exception as e:
+        logger.warning(f"Error fetching member {user_id}: {e}")
+        return None
+
+async def get_cached_user_roles(guild, user_id):
+    """Get user roles with caching"""
+    cache_key = f"roles_{guild.id}_{user_id}"
+    current_time = asyncio.get_event_loop().time()
+    
+    # Check cache first
+    if cache_key in role_cache:
+        cached_roles, cache_time = role_cache[cache_key]
+        if current_time - cache_time < cache_timeout:
+            return cached_roles
+    
+    # Fetch member and get roles
+    member = await get_cached_member(guild, user_id)
+    if member:
+        roles = get_user_roles(member)
+        role_cache[cache_key] = (roles, current_time)
+        return roles
+    else:
+        # Cache empty roles for non-existent members
+        role_cache[cache_key] = ([], current_time)
+        return []
+
+def schedule_data_write(data):
+    """Schedule data write instead of writing immediately"""
+    global pending_data_writes, last_data_write
+    current_time = asyncio.get_event_loop().time()
+    
+    # Store the latest data
+    pending_data_writes.update(data)
+    
+    # Write immediately if enough time has passed
+    if current_time - last_data_write >= DATA_WRITE_INTERVAL:
+        save_data(pending_data_writes)
+        pending_data_writes.clear()
+        last_data_write = current_time
+        return True
+    return False
+
+async def flush_pending_writes():
+    """Force write any pending data"""
+    global pending_data_writes, last_data_write
+    if pending_data_writes:
+        save_data(pending_data_writes)
+        pending_data_writes.clear()
+        last_data_write = asyncio.get_event_loop().time()
+
 @bot.event
 async def on_ready():
     logger.info(f'Logged in as {bot.user}!')
     logger.info('Bot is ready and running!')
+    
+    # Start periodic data flush task
+    asyncio.create_task(periodic_data_flush())
+
+async def periodic_data_flush():
+    """Periodically flush pending data writes"""
+    while True:
+        try:
+            await asyncio.sleep(DATA_WRITE_INTERVAL)
+            await flush_pending_writes()
+        except Exception as e:
+            logger.error(f"Error in periodic data flush: {e}")
+
+# Graceful shutdown handler
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info('Received shutdown signal, flushing pending data...')
+    asyncio.create_task(flush_pending_writes())
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 @bot.event
 async def on_message(message):
@@ -908,9 +1013,14 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Only track users with tracked roles
+    # Only track users with tracked roles - use cached member lookup
     try:
-        member = await message.guild.fetch_member(message.author.id)
+        member = await get_cached_member(message.guild, message.author.id)
+        if not member:
+            # Member not found, process commands but don't track
+            await bot.process_commands(message)
+            return
+            
         user_role_ids = [role.id for role in member.roles]
 
         # Check if user has any tracked role
@@ -925,14 +1035,6 @@ async def on_message(message):
             await bot.process_commands(message)
             return
 
-    except discord.NotFound:
-        logger.warning(f"Member {message.author.id} not found in guild")
-        await bot.process_commands(message)
-        return
-    except discord.Forbidden:
-        logger.warning(f"No permission to fetch member {message.author.id}")
-        await bot.process_commands(message)
-        return
     except Exception as e:
         logger.error(f"Error checking user roles for {message.author.id}: {e}")
         # If error occurs, still process commands
@@ -980,23 +1082,14 @@ async def on_message(message):
                     'twitter_links': new_links,
                 })
 
-                # Save back to primary data file
-                save_data(data)
+                # Schedule data write instead of immediate save
+                if not schedule_data_write(data):
+                    # If not written immediately, update pending data
+                    pending_data_writes.update(data)
                 logger.info(f"Content tracked: {len(new_links)} X/Twitter links from {message.author.name}")
 
-    # Get current user roles
-    try:
-        member = await message.guild.fetch_member(message.author.id)
-        current_roles = get_user_roles(member)
-    except discord.NotFound:
-        logger.warning(f"Member {message.author.id} not found when getting roles")
-        current_roles = []
-    except discord.Forbidden:
-        logger.warning(f"No permission to fetch member {message.author.id} for roles")
-        current_roles = []
-    except Exception as e:
-        logger.error(f"Error fetching member roles for {message.author.id}: {e}")
-        current_roles = []
+    # Get current user roles using cached function
+    current_roles = await get_cached_user_roles(message.guild, message.author.id)
 
     # Create user if not exists
     if user_id not in data:
@@ -1018,8 +1111,10 @@ async def on_message(message):
 
     data[user_id]['messages'].append(message_data)
 
-    # Save data
-    save_data(data)
+    # Schedule data write instead of immediate save
+    if not schedule_data_write(data):
+        # If not written immediately, update pending data
+        pending_data_writes.update(data)
 
     # Process commands
     await bot.process_commands(message)
@@ -1028,28 +1123,42 @@ async def on_message(message):
 async def on_member_update(before, after):
     """Update user roles when they change"""
     if before.roles != after.roles:
+        # Clear cache for this user since roles changed
+        cache_key = f"roles_{after.guild.id}_{after.id}"
+        if cache_key in role_cache:
+            del role_cache[cache_key]
+        
+        member_cache_key = f"{after.guild.id}_{after.id}"
+        if member_cache_key in member_cache:
+            # Update cached member with new data
+            current_time = asyncio.get_event_loop().time()
+            member_cache[member_cache_key] = (after, current_time)
+        
         # Load data
         data = load_data()
-
         user_id = str(after.id)
 
         # Update roles if user exists in our data
         if user_id in data:
             current_roles = get_user_roles(after)
             data[user_id]['current_roles'] = current_roles
-            save_data(data)
+            
+            # Schedule data write instead of immediate save
+            if not schedule_data_write(data):
+                pending_data_writes.update(data)
+                
             logger.info(f"Updated roles for user {after.name}: {current_roles}")
 
-            # Log role changes to audit log
+            # Log role changes to audit log (but don't let this fail the whole operation)
             try:
                 async for entry in after.guild.audit_logs(limit=1, action=discord.AuditLogAction.member_role_update):
                     if entry.target.id == after.id:
                         logger.info(f"Audit Log - Role change by {entry.user.name}: {len(entry.before.roles)} -> {len(entry.after.roles)} roles")
                         break
             except discord.Forbidden:
-                logger.warning("No permission to access audit logs")
+                logger.debug("No permission to access audit logs")
             except Exception as e:
-                logger.error(f"Audit log error: {e}")
+                logger.debug(f"Audit log error: {e}")
 
 @bot.event
 async def on_user_update(before, after):
@@ -1057,13 +1166,16 @@ async def on_user_update(before, after):
     if before.name != after.name:
         # Load data
         data = load_data()
-
         user_id = str(after.id)
 
         # Update username if user exists in our data
         if user_id in data:
             data[user_id]['username'] = after.name
-            save_data(data)
+            
+            # Schedule data write instead of immediate save
+            if not schedule_data_write(data):
+                pending_data_writes.update(data)
+                
             logger.info(f"Updated username for user {after.name}")
 
 @bot.command(name='filter')
