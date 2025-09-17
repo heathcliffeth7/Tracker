@@ -146,6 +146,44 @@ def parse_authorization_entry(entry: str, default_type: str = 'user') -> Optiona
 
     return entry_type, value
 
+
+def chunk_message_lines(lines: List[str], limit: int = 1900) -> List[str]:
+    """Split lines into chunks that respect Discord's message length limits"""
+    messages: List[str] = []
+    current_lines: List[str] = []
+    current_length = 0
+
+    for raw_line in lines:
+        line = str(raw_line) if raw_line is not None else ''
+
+        # Break apart lines that individually exceed the limit
+        while len(line) > limit:
+            if current_lines:
+                messages.append("\n".join(current_lines))
+                current_lines = []
+                current_length = 0
+            messages.append(line[:limit])
+            line = line[limit:]
+
+        if current_lines:
+            projected_length = current_length + len(line) + 1  # account for newline
+        else:
+            projected_length = len(line)
+
+        if current_lines and projected_length > limit:
+            messages.append("\n".join(current_lines))
+            current_lines = []
+            current_length = 0
+            projected_length = len(line)
+
+        current_lines.append(line)
+        current_length = projected_length
+
+    if current_lines:
+        messages.append("\n".join(current_lines))
+
+    return messages
+
 def load_content_channels():
     """Load content channels from the main messages data file"""
     global content_channels
@@ -1211,7 +1249,7 @@ class FilterEngine:
         self.time_units = {'h': 'hours', 'd': 'days', 'w': 'weeks', 'm': 'months', 'y': 'years'}
     
     def parse_filter_command(self, command_text: str) -> Dict[str, Any]:
-        """Parse filter command like 'message>10 @rol1 and @rol2 #kanal 7d'"""
+        """Parse filter command like 'message>10 @role1 and @role2 #channel 7d'"""
         filters = {
             'message_count': None,
             'roles': {'include': [], 'exclude': [], 'operator': 'and'},
@@ -2042,66 +2080,127 @@ async def on_message(message):
     except Exception as e:
         logger.error(f"Error processing message: {e}")
 
-@bot.command()
-async def stats(ctx):
-    """Show bot statistics with JSON DIRECT system"""
+@bot.command(name='trackstats')
+async def trackstats(ctx, *, identifier: str = None):
+    """Show user statistics by ID, mention, or username"""
     try:
-        elapsed = time.time() - tracker_stats['start_time']
-        msg_per_sec = tracker_stats['messages_processed'] / elapsed if elapsed > 0 else 0
-
         existing_data = await get_cached_data()
-        total_users = sum(1 for _ in iter_user_entries(existing_data))
 
-        # Calculate totals from counters
-        total_messages = 0
-        all_channels = set()
-        all_roles = set()
-        last_24_hours = 0
-        last_7_days = 0
-        last_30_days = 0
+        search_term = identifier.strip() if identifier else None
+        user_id = None
+        resolved_name = None
 
-        for _, user_data in iter_user_entries(existing_data):
-            counter = SmartCounter.from_dict(user_data.get('counter', {}))
-            total_messages += counter.total_count
+        if search_term is None:
+            user_id = str(ctx.author.id)
+            resolved_name = ctx.author.display_name
+        else:
+            mention_match = re.fullmatch(r'<@!?([0-9]+)>', search_term)
+            if mention_match:
+                user_id = mention_match.group(1)
+            elif search_term.isdigit():
+                user_id = search_term
 
-            # Collect channels and roles
-            all_channels.update(counter.channel_counts.keys())
-            all_roles.update(user_data.get('roles', []))
+        if not user_id and search_term:
+            guild = ctx.guild
+            if guild:
+                search_lower = search_term.lower()
+                matched_member = None
+                for member in guild.members:
+                    candidate_names = {member.name.lower(), member.display_name.lower()}
+                    discriminator = getattr(member, 'discriminator', None)
+                    if discriminator and discriminator != '0':
+                        candidate_names.add(f"{member.name}#{discriminator}".lower())
+                    if search_lower in candidate_names:
+                        matched_member = member
+                        break
 
-            # Calculate time ranges with accurate 24-hour counting
-            last_24_hours += counter.get_time_range_count(1)
-            last_7_days += counter.get_time_range_count(7)
-            last_30_days += counter.get_time_range_count(30)
+                if matched_member:
+                    user_id = str(matched_member.id)
+                    resolved_name = matched_member.display_name
 
-        # Calculate API metrics
-        api_calls_per_msg = tracker_stats['api_calls'] / max(tracker_stats['messages_processed'], 1)
-        api_savings = max(tracker_stats['messages_processed'] - tracker_stats['api_calls'], 0)
-        api_efficiency = ((api_savings / max(tracker_stats['messages_processed'], 1)) * 100) if tracker_stats['messages_processed'] > 0 else 0
+        if not user_id and search_term:
+            search_lower = search_term.lower()
+            for stored_id, stored_data in iter_user_entries(existing_data):
+                username_value = stored_data.get('username')
+                if username_value and username_value.lower() == search_lower:
+                    user_id = stored_id
+                    resolved_name = username_value
+                    break
 
-        pending_status = 'Yes' if file_manager.dirty else 'No'
-        storage_rate = tracker_stats['disk_writes'] / elapsed if elapsed > 0 else 0
+        if not user_id:
+            await ctx.send('User not found.')
+            return
 
-        lines = [
-            "🚀 Bot Statistics (JSON DIRECT)",
-            f"💬 Messages: processed {tracker_stats['messages_processed']:,} | rate {msg_per_sec:.1f}/s",
-            f"👥 Users: total {total_users:,}" if total_users > 0 else "👥 Users: total 0",
-            f"📊 Data: total {total_messages:,} | 24h {last_24_hours:,} | 7d {last_7_days:,} | 30d {last_30_days:,}",
-            f"📺 Channels tracked: {len(all_channels)}",
-            f"👑 Roles recorded: {len(all_roles)}",
-            f"⚡ API calls: {tracker_stats['api_calls']:,} | per msg {api_calls_per_msg:.3f}",
-            f"💾 API savings: {api_savings:,} | efficiency {api_efficiency:.1f}%",
-            f"🛡️ Rate limits hit: {tracker_stats['rate_limit_hits']:,}",
-            f"💽 Storage: pending flush {pending_status} | write rate {storage_rate:.2f}/s",
-            f"⏱️ Uptime: {elapsed/3600:.1f} hours"
+        user_data = existing_data.get(user_id)
+        if not user_data:
+            await ctx.send('User not found in database.')
+            return
+
+        counter = SmartCounter.from_dict(user_data.get('counter', {}))
+        content_counter = ContentCounter()
+        if 'content_counter' in user_data:
+            content_counter = ContentCounter.from_dict(user_data['content_counter'])
+
+        username = user_data.get('username') or resolved_name or 'Unknown'
+
+        time_ranges = [
+            ('24h', 1),
+            ('7d', 7),
+            ('30d', 30),
+            ('60d', 60),
+            ('90d', 90),
+            ('120d', 120),
+            ('180d', 180),
+            ('360d', 360),
         ]
 
-        if total_users > 0:
-            avg_messages = total_messages / total_users if total_users else 0
-            avg_roles = len(all_roles) / total_users if total_users else 0
-            lines.insert(3, f"📈 Averages: messages/user {avg_messages:.1f} | roles/user {avg_roles:.1f}")
+        lines = [
+            f"User: {username}",
+            f"ID: {user_id}"
+        ]
 
-        await ctx.send("\n".join(lines))
-            
+        if resolved_name and resolved_name != username:
+            lines.append(f"Server display name: {resolved_name}")
+
+        lines.append('')
+        lines.append('Message Counts:')
+        for label, days in time_ranges:
+            count = counter.get_time_range_count(days)
+            lines.append(f"- {label}: {count:,}")
+        lines.append(f"- Total: {counter.total_count:,}")
+
+        content_total = content_counter.get_total_content_count()
+        if content_total:
+            lines.append('')
+            lines.append('Content Link Counts:')
+            for label, days in time_ranges:
+                content_count = content_counter.get_time_range_count(days)
+                lines.append(f"- {label}: {content_count:,}")
+            lines.append(f"- Total: {content_total:,}")
+        else:
+            lines.append('')
+            lines.append('Content Links: No saved links.')
+
+        if content_counter.content_links:
+            lines.append('')
+            lines.append('Content Links:')
+            for index, link_data in enumerate(content_counter.content_links, 1):
+                link = link_data.get('link', 'Unknown')
+                timestamp = link_data.get('timestamp')
+                if timestamp:
+                    try:
+                        ts_obj = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        ts_display = ts_obj.strftime('%Y-%m-%d %H:%M')
+                    except ValueError:
+                        ts_display = timestamp
+                else:
+                    ts_display = 'No timestamp available'
+                lines.append(f"{index}. [{ts_display}] {link}")
+
+        messages = chunk_message_lines(lines)
+        for message in messages:
+            await ctx.send(message)
+
     except Exception as e:
         await ctx.send(f"Error getting stats: {e}")
 
@@ -2564,7 +2663,7 @@ async def trackcommands(ctx):
 **User Information:**
 • `!user_info @user` - Detailed user statistics with 24h data
 • `!top_users [amount]` - Top users by message count
-• `!stats` - Bot statistics with accurate 24h counting
+• `!trackstats [id|@mention|username]` - User message and content statistics
 
 **Advanced Filtering:**
 • `!filter [filters]` - Advanced filtering with Excel export
@@ -2615,7 +2714,7 @@ async def helpme(ctx):
 🤖 **Tracker Bot Commands:**
 
 **Core Commands:**
-• `!stats` - Show bot statistics
+• `!trackstats [id|@mention|username]` - User message and content stats
 • `!trackcommands` - List all commands (detailed)
 • `!system_info` - System information
 
@@ -2770,7 +2869,7 @@ async def test_channel_filter(ctx, channel_name: str = None, min_messages: int =
 @bot.command()
 async def filter(ctx, *, command_text: str = None):
     """Advanced filtering with Excel export
-    Usage: !filter message>10 content>2 @rol1 and @rol2 #kanal 7d
+    Usage: !filter message>10 content>2 @role1 and @role2 #channel 7d
     Example: !filter message>10 content>2 @early agi and @advanced agi #general 7d"""
     try:
         if not command_text:
@@ -2791,10 +2890,10 @@ async def filter(ctx, *, command_text: str = None):
 **Filters:**
 • `message>X`: Users with more than X messages
 • `content>X`: Users with more than X content links
-• `@rol1 and @rol2`: Users with BOTH roles
-• `@rol1 or @rol2`: Users with EITHER role
-• `nohave @rol3`: Users WITHOUT this role
-• `#kanal`: Messages in specific channel
+• `@role1 and @role2`: Users with BOTH roles
+• `@role1 or @role2`: Users with EITHER role
+• `nohave @role3`: Users WITHOUT this role
+• `#channel`: Messages in specific channel
 • `7d/1w/1m`: Last 7 days/1 week/1 month
 
 **Operators:** `>`, `<`, `>=`, `<=`, `==`, `!=`
