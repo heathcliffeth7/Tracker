@@ -1667,15 +1667,17 @@ class FilterEngine:
 
         # Define headers
         headers = [
-            'User ID', 'Username', 'Total Messages', 'Time Range Messages',
-            'Message Count 24h', 'Message Count 7d', 'Message Count 30d',
-            'Message Count 60d', 'Message Count 90d', 'Message Count 120d',
-            'Message Count 180d', 'Message Count 360d', 'Content Count 24h',
-            'Content Count 7d', 'Content Count 30d', 'Content Count 60d',
-            'Content Count 90d', 'Content Count 120d', 'Content Count 180d',
-            'Content Count 360d', 'Total Content Links', 'Content Links',
+            'User ID', 'Username', 'Channel Messages', 'Total Messages', 'Time Range Messages',
+            'Channel 24h', 'Channel 7d', 'Channel 30d', 'Channel 90d', 'Channel 120d',
+            'Channel 180d', 'Channel 360d',
+            'Total 24h', 'Total 7d', 'Total 30d', 'Total 90d', 'Total 120d',
+            'Total 180d', 'Total 360d',
+            'Content 24h', 'Content 7d', 'Content 30d', 'Content 90d',
+            'Content 120d', 'Content 180d', 'Content 360d', 'Total Content Links', 'Content Links',
             'Roles', 'First Seen', 'Last Seen', 'First Content Seen', 'Last Content Seen'
         ]
+
+        content_links_col = headers.index('Content Links') + 1
 
         # Write headers
         for col_num, header in enumerate(headers, 1):
@@ -1684,6 +1686,16 @@ class FilterEngine:
             cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
 
         # Prepare and write data
+        time_windows_days = [
+            (1, '24h'),
+            (7, '7d'),
+            (30, '30d'),
+            (90, '90d'),
+            (120, '120d'),
+            (180, '180d'),
+            (360, '360d')
+        ]
+
         for row_num, user in enumerate(results, 2):
             counter = user['counter']
             content_counter = user['content_counter']
@@ -1700,35 +1712,23 @@ class FilterEngine:
 
             # Message statistics
             if filters.get('channels'):
-                channel_msg_24h = sum(counter.get_channel_count(channel, 1) for channel in filters['channels'])
-                channel_msg_7d = sum(counter.get_channel_count(channel, 7) for channel in filters['channels'])
-                channel_msg_30d = sum(counter.get_channel_count(channel, 30) for channel in filters['channels'])
-                channel_msg_60d = sum(counter.get_channel_count(channel, 60) for channel in filters['channels'])
-                channel_msg_90d = sum(counter.get_channel_count(channel, 90) for channel in filters['channels'])
-                channel_msg_120d = sum(counter.get_channel_count(channel, 120) for channel in filters['channels'])
-                channel_msg_180d = sum(counter.get_channel_count(channel, 180) for channel in filters['channels'])
-                channel_msg_360d = sum(counter.get_channel_count(channel, 360) for channel in filters['channels'])
-                total_channel_msgs = sum(counter.channel_counts.get(channel, 0) for channel in filters['channels'])
+                tracked_channels = filters['channels']
+                channel_totals = [counter.get_channel_count(channel) for channel in tracked_channels]
+                channel_counts = [
+                    sum(counter.get_channel_count(channel, days) for channel in tracked_channels)
+                    for days, _ in time_windows_days
+                ]
+                total_channel_msgs = sum(channel_totals)
             else:
-                channel_msg_24h = counter.get_time_range_count(1)
-                channel_msg_7d = counter.get_time_range_count(7)
-                channel_msg_30d = counter.get_time_range_count(30)
-                channel_msg_60d = counter.get_time_range_count(60)
-                channel_msg_90d = counter.get_time_range_count(90)
-                channel_msg_120d = counter.get_time_range_count(120)
-                channel_msg_180d = counter.get_time_range_count(180)
-                channel_msg_360d = counter.get_time_range_count(360)
+                channel_totals = [counter.total_count]
+                channel_counts = [counter.get_time_range_count(days) for days, _ in time_windows_days]
                 total_channel_msgs = counter.total_count
 
+            overall_total_msgs = counter.total_count
+            total_counts = [counter.get_time_range_count(days) for days, _ in time_windows_days]
+
             # Content statistics
-            content_count_24h = content_counter.get_time_range_count(1)
-            content_count_7d = content_counter.get_time_range_count(7)
-            content_count_30d = content_counter.get_time_range_count(30)
-            content_count_60d = content_counter.get_time_range_count(60)
-            content_count_90d = content_counter.get_time_range_count(90)
-            content_count_120d = content_counter.get_time_range_count(120)
-            content_count_180d = content_counter.get_time_range_count(180)
-            content_count_360d = content_counter.get_time_range_count(360)
+            content_counts = [content_counter.get_time_range_count(days) for days, _ in time_windows_days]
             total_content = len(content_counter.content_links)
 
             # Write basic data
@@ -1736,23 +1736,11 @@ class FilterEngine:
                 user['user_id'],
                 user['username'],
                 total_channel_msgs,
+                overall_total_msgs,
                 time_range_count,
-                channel_msg_24h,
-                channel_msg_7d,
-                channel_msg_30d,
-                channel_msg_60d,
-                channel_msg_90d,
-                channel_msg_120d,
-                channel_msg_180d,
-                channel_msg_360d,
-                content_count_24h,
-                content_count_7d,
-                content_count_30d,
-                content_count_60d,
-                content_count_90d,
-                content_count_120d,
-                content_count_180d,
-                content_count_360d,
+                *channel_counts,
+                *total_counts,
+                *content_counts,
                 total_content,
                 '',  # Content Links - will be filled with hyperlinks
                 ', '.join(user['roles']),
@@ -1764,10 +1752,11 @@ class FilterEngine:
 
             # Write row data
             for col_num, value in enumerate(row_data, 1):
-                ws.cell(row=row_num, column=col_num, value=value)
+                cell = ws.cell(row=row_num, column=col_num, value=value)
+                wrap = isinstance(value, str) and '\n' in value
+                cell.alignment = Alignment(vertical='top', wrap_text=wrap)
 
             # Add hyperlinks for content links - EACH LINK SEPARATELY CLICKABLE
-            content_links_col = 22  # Content Links column
             if content_counter.content_links:
                 # Create single hyperlink pointing to last link
                 if content_counter.content_links:
@@ -1779,7 +1768,7 @@ class FilterEngine:
 
                     # Create cell with all links displayed
                     cell = ws.cell(row=row_num, column=content_links_col, value=combined_display)
-
+                    
                     # Set hyperlink to the LAST link (entire display text points to final link)
                     last_link = content_counter.content_links[-1]['link']
                     cell.hyperlink = last_link
@@ -2183,10 +2172,22 @@ async def trackstats(ctx, *, identifier: str = None):
 
         if content_counter.content_links:
             lines.append('')
-            lines.append('Content Links:')
+            lines.append('Content Links: see embeds below for full list.')
+
+        messages = chunk_message_lines(lines)
+        for message in messages:
+            await ctx.send(message)
+
+        if content_counter.content_links:
+            MAX_EMBED_DESC = 4096
+            page = 1
+            current_lines: List[str] = []
+            current_length = 0
+
             for index, link_data in enumerate(content_counter.content_links, 1):
                 link = link_data.get('link', 'Unknown')
                 timestamp = link_data.get('timestamp')
+
                 if timestamp:
                     try:
                         ts_obj = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
@@ -2195,11 +2196,34 @@ async def trackstats(ctx, *, identifier: str = None):
                         ts_display = timestamp
                 else:
                     ts_display = 'No timestamp available'
-                lines.append(f"{index}. [{ts_display}] {link}")
 
-        messages = chunk_message_lines(lines)
-        for message in messages:
-            await ctx.send(message)
+                line = f"{index}. [{ts_display}]({link})" if link and link != 'Unknown' else f"{index}. {ts_display} - {link}"
+
+                if len(line) > MAX_EMBED_DESC:
+                    line = line[:MAX_EMBED_DESC - 3] + '...'
+
+                projected_length = current_length + len(line) + (1 if current_lines else 0)
+                if projected_length > MAX_EMBED_DESC and current_lines:
+                    embed = discord.Embed(
+                        title=f"Content Links (Page {page})",
+                        description="\n".join(current_lines),
+                        colour=discord.Colour.blurple()
+                    )
+                    await ctx.send(embed=embed)
+                    page += 1
+                    current_lines = []
+                    current_length = 0
+
+                current_lines.append(line)
+                current_length += len(line) + 1
+
+            if current_lines:
+                embed = discord.Embed(
+                    title=f"Content Links (Page {page})",
+                    description="\n".join(current_lines),
+                    colour=discord.Colour.blurple()
+                )
+                await ctx.send(embed=embed)
 
     except Exception as e:
         await ctx.send(f"Error getting stats: {e}")
