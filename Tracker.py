@@ -24,10 +24,15 @@ from urllib.parse import urlparse
 load_dotenv()
 
 # Configuration
-TRACKED_ROLE_IDS = os.getenv('TRACKED_ROLE_IDS', '').split(',') if os.getenv('TRACKED_ROLE_IDS') else []
-TRACKED_ROLE_IDS = [role_id.strip() for role_id in TRACKED_ROLE_IDS if role_id.strip()]
+def _parse_id_list(value: Optional[str]) -> Set[str]:
+    if not value:
+        return set()
+    return {token.strip() for token in value.split(',') if token.strip()}
+
+
+TRACKED_ROLE_IDS = _parse_id_list(os.getenv('TRACKED_ROLE_IDS'))
 BOT_OWNER_ID = os.getenv('BOT_OWNER_ID')
-SECURITY_MANAGER_ROLE_ID = os.getenv('SECURITY_MANAGER_ROLE_ID')
+SECURITY_MANAGER_ROLE_IDS = _parse_id_list(os.getenv('SECURITY_MANAGER_ROLE_ID'))
 
 # Setup logging
 logging.basicConfig(
@@ -300,10 +305,10 @@ def is_bot_owner(member: discord.abc.User) -> bool:
 
 
 def is_security_manager(member: discord.abc.User) -> bool:
-    if not SECURITY_MANAGER_ROLE_ID:
+    if not SECURITY_MANAGER_ROLE_IDS:
         return False
     roles = getattr(member, 'roles', [])
-    return any(str(role.id) == SECURITY_MANAGER_ROLE_ID for role in roles)
+    return any(str(role.id) in SECURITY_MANAGER_ROLE_IDS for role in roles)
 
 
 def is_authorized_member(member: discord.abc.User) -> bool:
@@ -2729,7 +2734,9 @@ Generated Excel includes:
 
 **Note:** Excel export is generated automatically when you run `!filter`
 """
-    await ctx.send(help_text)
+    lines = help_text.strip('\n').split('\n')
+    for chunk in chunk_message_lines(lines):
+        await ctx.send(chunk)
 
 @bot.command()
 async def helpme(ctx):
